@@ -1244,22 +1244,122 @@ ${textForAI}
   }
 }
 
-// ★ 新しいエンドポイント /persona/arrangeBoard（複数Board対応）
+// ★ 改善版 /persona/arrangeBoard（複数Board対応）
 if (method === "POST" && path === "/persona/arrangeBoard") {
   const body = await req.json();
 
-  // 単体 or 複数両対応
   const boards = Array.isArray(body.boards)
     ? body.boards
-    : [{ topic: body.topic || "", spec: body.spec || "impact-feasibility", notes: body.notes || [] }];
+    : [
+        {
+          topic: body.topic || "",
+          spec: body.spec || "impact-feasibility",
+          notes: body.notes || [],
+        },
+      ];
+
+  function spreadPositions(notes: any[]) {
+    const centerX = 50;
+    const centerY = 50;
+    const radius = 18;
+
+    return notes.map((n, i) => {
+      const angle = (2 * Math.PI * i) / Math.max(notes.length, 1);
+      return {
+        id: n.id,
+        xP: Math.max(
+          5,
+          Math.min(95, Math.round(centerX + radius * Math.cos(angle)))
+        ),
+        yP: Math.max(
+          5,
+          Math.min(95, Math.round(centerY + radius * Math.sin(angle)))
+        ),
+      };
+    });
+  }
+
+  function normalizePositions(positions: any[], notes: any[]) {
+    const validIds = new Set(notes.map((n) => n.id));
+
+    let normalized = Array.isArray(positions)
+      ? positions
+          .filter((p) => p && validIds.has(p.id))
+          .map((p) => ({
+            id: p.id,
+            xP: Math.max(0, Math.min(100, Number(p.xP ?? 50))),
+            yP: Math.max(0, Math.min(100, Number(p.yP ?? 50))),
+          }))
+      : [];
+
+    const samePoint =
+      normalized.length > 1 &&
+      normalized.every(
+        (p) => p.xP === normalized[0].xP && p.yP === normalized[0].yP
+      );
+
+    const missingIds = notes.some(
+      (n) => !normalized.find((p) => p.id === n.id)
+    );
+
+    if (!normalized.length || samePoint || missingIds) {
+      console.warn("⚠️ arrangeBoard fallback spread applied", {
+        samePoint,
+        missingIds,
+        received: normalized,
+      });
+      normalized = spreadPositions(notes);
+    }
+
+    return normalized;
+  }
+
+  function buildSpecExplanation(spec: string) {
+    switch (spec) {
+      case "impact-feasibility":
+        return `
+- impact-feasibility:
+  xP = 実現可能性（0=低, 100=高）
+  yP = 効果（0=低, 100=高）
+`;
+      case "importance-urgency":
+        return `
+- importance-urgency:
+  xP = 緊急度（0=低, 100=高）
+  yP = 重要度（0=低, 100=高）
+`;
+      case "individual-collective":
+        return `
+- individual-collective:
+  xP = 個人的↔全体的（0=個人的, 100=全体的）
+  yP = 主観的↔客観的（0=主観的, 100=客観的）
+`;
+      default:
+        return `
+- impact-feasibility:
+  xP = 実現可能性（0=低, 100=高）
+  yP = 効果（0=低, 100=高）
+`;
+    }
+  }
 
   try {
     const client = new OpenAI({ apiKey: env.OPENAI_API_KEY });
-
-    // 各boardを個別にOpenAIへ投げる
     const results: any[] = [];
 
     for (const b of boards) {
+      const noteText = (b.notes || [])
+        .map((n: any, i: number) => {
+          return [
+            `ノート${i + 1}`,
+            `id: ${n.id}`,
+            `title: ${n.title || "無題"}`,
+            `author: ${n.author || "unknown"}`,
+            `lines: ${(n.lines || []).join(" / ")}`,
+          ].join("\n");
+        })
+        .join("\n\n");
+
       const completion = await client.chat.completions.create({
         model: "gpt-4o-mini",
         temperature: 0,
@@ -1267,42 +1367,68 @@ if (method === "POST" && path === "/persona/arrangeBoard") {
           {
             role: "system",
             content: `
-あなたは議論配置アシスタントです。
-次のノートを、2軸(${b.spec})に沿って配置してください。
-返すのはJSON形式だけです。
+あなたは議論ボード配置アシスタントです。
+各ノートを必ず個別に評価し、2軸に基づいて 0〜100 の座標へ配置してください。
 
-出力例:
+重要ルール:
+- すべてのノートについて positions を1件ずつ返すこと
+- 各 position の id は入力ノートの id と必ず一致させること
+- xP と yP は 0〜100 の数値にすること
+- ノートごとの内容差がある場合、できるだけ異なる座標に配置すること
+- 全てのノートを同じ座標に置かないこと
+- 内容が似ていても、完全に同一座標は避け、少しずらして配置すること
+- JSON以外は返さないこと
+
+軸の意味:
+${buildSpecExplanation(b.spec)}
+
+出力形式:
 {
   "positions": [
-    {"id":"ノートID","xP":0-100,"yP":0-100},
-    ...
+    { "id": "ノートID", "xP": 12, "yP": 85 },
+    { "id": "ノートID", "xP": 67, "yP": 34 }
   ]
-}`,
+}
+`,
           },
           {
             role: "user",
-            content: `議題: ${b.topic}\nノート:\n${JSON.stringify(b.notes, null, 2)}`,
+            content: `議題: ${b.topic}
+軸: ${b.spec}
+
+以下の各ノートを個別に評価して配置してください。
+すべてのノートに対して positions を返してください。
+
+${noteText}`,
           },
         ],
       });
 
       const raw = completion.choices[0]?.message?.content || "{}";
-      let parsed;
+      let parsed: any;
+
       try {
         parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
       } catch {
         parsed = { positions: [] };
       }
 
+      const positions = normalizePositions(parsed.positions, b.notes || []);
+
       results.push({
         topic: b.topic,
         spec: b.spec,
-        positions: parsed.positions || [],
+        positions,
       });
     }
 
     const h = withCors(new Headers(), origin);
-    return addEngineHeaders(json({ ok: true, results }, 200, h), method, path, rawPath);
+    return addEngineHeaders(
+      json({ ok: true, results }, 200, h),
+      method,
+      path,
+      rawPath
+    );
   } catch (err) {
     console.error("❌ arrangeBoard failed:", err);
     const h = withCors(new Headers(), origin);
