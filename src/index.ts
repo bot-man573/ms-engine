@@ -30,13 +30,11 @@ const pick = (o: any, keys: string[]) => {
 };
 
 function requireCompany(body: any) {
-  if (!body || !body.companyCode) {
-    throw new Response(
-      JSON.stringify({ error: "COMPANY_CODE_REQUIRED" }),
-      { status: 401, headers: { "Content-Type": "application/json" } }
-    );
+  const companyCode = String(body?.companyCode ?? "").trim();
+  if (!companyCode) {
+    throw new Error("missing_companyCode");
   }
-  return body.companyCode;
+  return companyCode;
 }
 
 function isFacilitator(req: Request, env: Env) {
@@ -1774,44 +1772,90 @@ if (method === "POST" && path === "/persona/userState") {
 // ===============================A
 // 📄 GET：/persona/teamUserStates（companyCode対応）
 // ===============================
-if (method === "GET" && path === "/persona/teamUserStates") {
+if (method === "OPTIONS" && path === "/persona/teamUserStates") {
   const h = withCors(new Headers(), origin);
-  const companyCode = url.searchParams.get("companyCode");
-  const team = url.searchParams.get("team");
-
-  if (!companyCode) {
-    return new Response(JSON.stringify({ error: "missing_companyCode" }), {
-      status: 401,
-      headers: h,
-    });
-  }
-
-  if (!team) {
-    return new Response(JSON.stringify({ error: "missing_team" }), {
-      status: 400,
-      headers: h,
-    });
-  }
-
-  const list = await env.TEAM_STATE.list({
-    prefix: `team:${companyCode}:${team}:user:`,
-  });
-
-  const users: any[] = [];
-  for (const k of list.keys) {
-    const v = await env.TEAM_STATE.get(k.name, "json");
-    if (v) users.push(v);
-  }
-
   return addEngineHeaders(
-    new Response(JSON.stringify({ users }), {
-      status: 200,
-      headers: h,
-    }),
+    new Response(null, { status: 204, headers: h }),
     method,
     path,
     rawPath
   );
+}
+
+if (method === "GET" && path === "/persona/teamUserStates") {
+  const h = withCors(new Headers(), origin);
+
+  try {
+    const companyCode = url.searchParams.get("companyCode");
+    const team = url.searchParams.get("team");
+
+    console.log("🧪 teamUserStates query:", { companyCode, team });
+
+    if (!companyCode) {
+      return addEngineHeaders(
+        new Response(JSON.stringify({ error: "missing_companyCode" }), {
+          status: 401,
+          headers: h,
+        }),
+        method,
+        path,
+        rawPath
+      );
+    }
+
+    if (!team) {
+      return addEngineHeaders(
+        new Response(JSON.stringify({ error: "missing_team" }), {
+          status: 400,
+          headers: h,
+        }),
+        method,
+        path,
+        rawPath
+      );
+    }
+
+    const prefix = `team:${companyCode}:${team}:user:`;
+    console.log("🧪 teamUserStates prefix:", prefix);
+
+    const list = await env.TEAM_STATE.list({ prefix });
+    console.log("🧪 teamUserStates keys:", list.keys.map(k => k.name));
+
+    const users: any[] = [];
+    for (const k of list.keys) {
+      const v = await env.TEAM_STATE.get(k.name, "json");
+      console.log("🧪 teamUserStates entry:", k.name, v);
+      if (v) users.push(v);
+    }
+
+    return addEngineHeaders(
+      new Response(JSON.stringify({ users }), {
+        status: 200,
+        headers: h,
+      }),
+      method,
+      path,
+      rawPath
+    );
+  } catch (err) {
+    console.error("❌ teamUserStates failed:", err);
+
+    return addEngineHeaders(
+      new Response(
+        JSON.stringify({
+          error: "teamUserStates_failed",
+          message: String(err),
+        }),
+        {
+          status: 500,
+          headers: h,
+        }
+      ),
+      method,
+      path,
+      rawPath
+    );
+  }
 }
 
 // ===============================
@@ -1822,56 +1866,60 @@ if (method === "POST" && path === "/team/updateMembers") {
 
   try {
     const body = await req.json();
+    console.log("🧪 updateMembers body:", JSON.stringify(body));
+
     const companyCode = requireCompany(body);
     const team = body.team;
     const members: string[] = body.members;
 
+    console.log("🧪 parsed updateMembers:", {
+      companyCode,
+      team,
+      members,
+      membersType: Array.isArray(members) ? "array" : typeof members,
+    });
+
     if (!team || !Array.isArray(members)) {
       return addEngineHeaders(
-        json({ error: "invalid_args" }, 400, h),
+        json({ error: "invalid_args", body }, 400, h),
         method,
         path,
         rawPath
       );
     }
 
-    // -----------------------------
-    // ① チームメタ情報を取得
-    // -----------------------------
+    const normalizedMembers = [...new Set(
+      members
+        .map((m) => String(m ?? "").trim())
+        .filter(Boolean)
+    )];
+
+    console.log("🧪 normalizedMembers:", normalizedMembers);
+
     const metaKey = `team:${companyCode}:${team}:meta`;
     const rawMeta = await env.TEAM_STATE.get(metaKey);
     const meta = rawMeta
       ? JSON.parse(rawMeta)
       : { team, users: [], roles: {} };
 
-    // -----------------------------
-    // ② 名簿を「確定名簿」で上書き
-    // -----------------------------
-    meta.users = members;
+    meta.users = normalizedMembers;
     meta.updatedAt = new Date().toISOString();
 
     await env.TEAM_STATE.put(metaKey, JSON.stringify(meta));
 
-    // -----------------------------
-    // ③ userState KV を掃除（除籍者削除）
-    // -----------------------------
     const list = await env.TEAM_STATE.list({
       prefix: `team:${companyCode}:${team}:user:`,
     });
 
     for (const k of list.keys) {
-      const userId = k.name.replace(
-        `team:${companyCode}:${team}:user:`,
-        ""
-      );
-
-      if (!members.includes(userId)) {
+      const userId = k.name.replace(`team:${companyCode}:${team}:user:`, "");
+      if (!normalizedMembers.includes(userId)) {
         await env.TEAM_STATE.delete(k.name);
       }
     }
 
     return addEngineHeaders(
-      json({ ok: true, team, members }, 200, h),
+      json({ ok: true, team, members: normalizedMembers }, 200, h),
       method,
       path,
       rawPath
