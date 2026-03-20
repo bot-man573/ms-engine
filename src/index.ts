@@ -1789,8 +1789,6 @@ if (method === "GET" && path === "/persona/teamUserStates") {
     const companyCode = url.searchParams.get("companyCode");
     const team = url.searchParams.get("team");
 
-    console.log("🧪 teamUserStates query:", { companyCode, team });
-
     if (!companyCode) {
       return addEngineHeaders(
         new Response(JSON.stringify({ error: "missing_companyCode" }), {
@@ -1815,17 +1813,21 @@ if (method === "GET" && path === "/persona/teamUserStates") {
       );
     }
 
-    const prefix = `team:${companyCode}:${team}:user:`;
-    console.log("🧪 teamUserStates prefix:", prefix);
+    const metaKey = `team:${companyCode}:${team}:meta`;
+    const rawMeta = await env.TEAM_STATE.get(metaKey);
+    const meta = rawMeta ? JSON.parse(rawMeta) : { users: [] };
 
-    const list = await env.TEAM_STATE.list({ prefix });
-    console.log("🧪 teamUserStates keys:", list.keys.map(k => k.name));
+    const userIds = Array.isArray(meta.users) ? meta.users : [];
 
     const users: any[] = [];
-    for (const k of list.keys) {
-      const v = await env.TEAM_STATE.get(k.name, "json");
-      console.log("🧪 teamUserStates entry:", k.name, v);
-      if (v) users.push(v);
+    for (const userId of userIds) {
+      const key = `team:${companyCode}:${team}:user:${userId}`;
+      const v = await env.TEAM_STATE.get(key, "json");
+      if (v) {
+        users.push(v);
+      } else {
+        users.push({ userId, name: userId });
+      }
     }
 
     return addEngineHeaders(
@@ -1872,13 +1874,6 @@ if (method === "POST" && path === "/team/updateMembers") {
     const team = body.team;
     const members: string[] = body.members;
 
-    console.log("🧪 parsed updateMembers:", {
-      companyCode,
-      team,
-      members,
-      membersType: Array.isArray(members) ? "array" : typeof members,
-    });
-
     if (!team || !Array.isArray(members)) {
       return addEngineHeaders(
         json({ error: "invalid_args", body }, 400, h),
@@ -1889,12 +1884,8 @@ if (method === "POST" && path === "/team/updateMembers") {
     }
 
     const normalizedMembers = [...new Set(
-      members
-        .map((m) => String(m ?? "").trim())
-        .filter(Boolean)
+      members.map((m) => String(m ?? "").trim()).filter(Boolean)
     )];
-
-    console.log("🧪 normalizedMembers:", normalizedMembers);
 
     const metaKey = `team:${companyCode}:${team}:meta`;
     const rawMeta = await env.TEAM_STATE.get(metaKey);
@@ -1906,17 +1897,6 @@ if (method === "POST" && path === "/team/updateMembers") {
     meta.updatedAt = new Date().toISOString();
 
     await env.TEAM_STATE.put(metaKey, JSON.stringify(meta));
-
-    const list = await env.TEAM_STATE.list({
-      prefix: `team:${companyCode}:${team}:user:`,
-    });
-
-    for (const k of list.keys) {
-      const userId = k.name.replace(`team:${companyCode}:${team}:user:`, "");
-      if (!normalizedMembers.includes(userId)) {
-        await env.TEAM_STATE.delete(k.name);
-      }
-    }
 
     return addEngineHeaders(
       json({ ok: true, team, members: normalizedMembers }, 200, h),
